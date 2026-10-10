@@ -37,7 +37,7 @@ IS_WIN = sys.platform.startswith("win")
 APP_DIR = (os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False)
            else os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(APP_DIR, "multimtr.json")
-WARN_LOSS = 0.05    # % mất gói từ mức này trở lên -> tô vàng
+WARN_LOSS = 0.333    # % mất gói từ mức này trở lên -> tô vàng
 DEFAULT_HOSTS = ["192.168.1.1", "203.113.131.1", "youtube.com", "facebook.com", "voz.vn"]
 
 # Kết quả một lần probe: (kind, ip, rtt_ms)
