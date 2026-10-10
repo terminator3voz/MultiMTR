@@ -13,6 +13,7 @@ Chạy:  python multimtr.py
 import ipaddress
 import itertools
 import json
+import math
 import os
 import queue
 import re
@@ -22,6 +23,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.error
 import urllib.request
 import zipfile
 from collections import deque
@@ -189,61 +191,141 @@ class Resolver:
 
 
 # --------------------------------------------------------------------------
-# Tra cứu vị trí địa lý của IP (nền, có cache) - dùng ip-api.com (miễn phí, không cần key)
+# Vị trí địa lý của IP (nền, có cache)
+#  1) Host chạy sau Cloudflare: hỏi https://<host>/cdn-cgi/trace -> lấy "colo" (datacenter
+#     thực sự đang phục vụ bạn, ví dụ HKG/SIN) -> chính xác.
+#  2) Còn lại: tra ip-api.com. Nếu RTT đo được NHỎ HƠN giới hạn vật lý tới vị trí đó
+#     (ánh sáng trong cáp quang ~200 km/ms) thì vị trí trong CSDL chắc chắn sai -> IP anycast/CDN.
 # --------------------------------------------------------------------------
+def _haversine_km(a, b):
+    la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 12742.0 * math.asin(math.sqrt(h))
+
+
 class GeoLocator:
     RETRY_AFTER = 30.0      # giây, thử lại nếu tra cứu lỗi (mất mạng, bị giới hạn 45 req/phút...)
+    COLOS = {
+        "HAN": "Hanoi", "SGN": "Ho Chi Minh City", "DAD": "Da Nang", "HKG": "Hong Kong",
+        "SIN": "Singapore", "BKK": "Bangkok", "KUL": "Kuala Lumpur", "CGK": "Jakarta",
+        "MNL": "Manila", "TPE": "Taipei", "NRT": "Tokyo", "KIX": "Osaka", "ICN": "Seoul",
+        "BOM": "Mumbai", "DEL": "Delhi", "MAA": "Chennai", "SYD": "Sydney", "MEL": "Melbourne",
+        "LAX": "Los Angeles", "SJC": "San Jose", "SEA": "Seattle", "ORD": "Chicago",
+        "DFW": "Dallas", "IAD": "Ashburn", "EWR": "Newark", "MIA": "Miami", "ATL": "Atlanta",
+        "YYZ": "Toronto", "YVR": "Vancouver", "LHR": "London", "FRA": "Frankfurt",
+        "AMS": "Amsterdam", "CDG": "Paris", "MAD": "Madrid", "MXP": "Milan", "DXB": "Dubai",
+        "GRU": "Sao Paulo", "JNB": "Johannesburg",
+    }
 
     def __init__(self):
-        self.cache = {}
+        self.cache = {}         # ip -> "City, Country"
+        self.coords = {}        # ip -> (lat, lon)
+        self.cf = {}            # host -> mã colo Cloudflare, hoặc "" nếu không phải Cloudflare
+        self.me = None          # (lat, lon) của chính máy này
         self._pending = set()
         self._retry_at = {}
         self._q = queue.Queue()
         threading.Thread(target=self._worker, daemon=True).start()
 
     @staticmethod
-    def _is_local(ip):
+    def _is_ip(text):
+        try:
+            ipaddress.ip_address(text)
+            return True
+        except ValueError:
+            return False
+
+    def _is_local(self, ip):
         try:
             a = ipaddress.ip_address(ip)
         except ValueError:
             return False
         return a.is_private or a.is_loopback or a.is_link_local
 
-    def get(self, ip):
+    def _request(self, key):
+        if key in self._pending or time.monotonic() < self._retry_at.get(key, 0):
+            return
+        self._pending.add(key)
+        self._q.put(key)
+
+    def get(self, ip, target=None, rtt=None):
+        """ip: IP đích; target: tên host người dùng nhập; rtt: RTT tốt nhất (ms) tới đích."""
         if not ip:
             return ""
-        if ip in self.cache:
-            return self.cache[ip]
         if self._is_local(ip):
-            self.cache[ip] = "Mạng nội bộ (LAN)"
-            return self.cache[ip]
-        if ip not in self._pending and time.monotonic() >= self._retry_at.get(ip, 0):
-            self._pending.add(ip)
-            self._q.put(ip)
-        return "..."
+            return "Mạng nội bộ (LAN)"
+        if self.me is None:
+            self._request(("me",))
+        if target and not self._is_ip(target) and re.fullmatch(r"[A-Za-z0-9.-]+", target) \
+                and target not in self.cf:
+            self._request(("cf", target))
+        colo = self.cf.get(target)
+        if colo:
+            return "%s (%s) - Cloudflare" % (self.COLOS.get(colo, colo), colo)
+        if ip not in self.cache:
+            self._request(("geo", ip))
+            return "..."
+        loc = self.cache[ip]
+        if rtt is not None and self.me and ip in self.coords:
+            min_rtt = _haversine_km(self.me, self.coords[ip]) / 100.0   # RTT tối thiểu theo vật lý
+            if rtt < 0.8 * min_rtt:
+                return "Anycast/CDN (%s)" % loc
+        return loc
 
-    def _lookup(self, ip):
-        url = "http://ip-api.com/json/%s?fields=status,country,regionName,city" % ip
+    # ---- các loại tra cứu (chạy ở luồng nền) ----
+    def _fetch_json(self, url):
         with urllib.request.urlopen(url, timeout=6) as r:
-            d = json.loads(r.read().decode("utf-8", "replace"))
+            return json.loads(r.read().decode("utf-8", "replace"))
+
+    def _do_geo(self, ip):
+        d = self._fetch_json("http://ip-api.com/json/%s?fields=status,country,city,lat,lon" % ip)
         if d.get("status") != "success":
-            return None
-        parts = [d.get("city"), d.get("country")]
-        return ", ".join(p for p in parts if p) or d.get("regionName") or "?"
+            return False
+        self.cache[ip] = ", ".join(p for p in (d.get("city"), d.get("country")) if p) or "?"
+        if "lat" in d and "lon" in d:
+            self.coords[ip] = (d["lat"], d["lon"])
+        return True
+
+    def _do_me(self):
+        d = self._fetch_json("http://ip-api.com/json/?fields=status,lat,lon")
+        if d.get("status") != "success":
+            return False
+        self.me = (d["lat"], d["lon"])
+        return True
+
+    def _do_cf(self, host):
+        req = urllib.request.Request("https://%s/cdn-cgi/trace" % host,
+                                     headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=6) as r:
+                body = r.read(4096).decode("utf-8", "replace")
+        except urllib.error.HTTPError as ex:
+            if ex.code == 429 or ex.code >= 500:
+                return False
+            self.cf[host] = ""          # 403/404...: không phải Cloudflare
+            return True
+        m = re.search(r"^colo=(\w+)", body, re.M)
+        self.cf[host] = m.group(1).upper() if m else ""
+        return True
 
     def _worker(self):
         while True:
-            ip = self._q.get()
+            key = self._q.get()
+            kind = key[0]
             try:
-                loc = self._lookup(ip)
+                if kind == "geo":
+                    ok = self._do_geo(key[1])
+                elif kind == "me":
+                    ok = self._do_me()
+                else:
+                    ok = self._do_cf(key[1])
             except Exception:  # noqa: BLE001
-                loc = None
-            if loc is None:
-                self._retry_at[ip] = time.monotonic() + self.RETRY_AFTER
-            else:
-                self.cache[ip] = loc
-            self._pending.discard(ip)
-            time.sleep(1.4)         # giữ dưới giới hạn 45 request/phút của ip-api
+                ok = False
+            if not ok:
+                self._retry_at[key] = time.monotonic() + self.RETRY_AFTER
+            self._pending.discard(key)
+            if kind != "cf":
+                time.sleep(1.4)         # giữ dưới giới hạn 45 request/phút của ip-api
 
 
 # --------------------------------------------------------------------------
@@ -581,8 +663,8 @@ class App(tk.Tk):
         hf = ttk.LabelFrame(paned, text="Các host đang theo dõi (chọn 1 dòng để xem chi tiết từng hop)")
         cols = ("host", "location", "ip", "state", "hops", "loss", "avg", "worst", "last")
         self.host_tree = ttk.Treeview(hf, columns=cols, show="headings", height=6, selectmode="extended")
-        heads = [("host", "Host", 130), ("location", "Location", 200), ("ip", "IP", 130), ("state", "Trạng thái", 150),
-                 ("hops", "Số hop", 60), ("loss", "Loss % (đích)", 100), ("avg", "Avg", 70),
+        heads = [("host", "Host", 120), ("location", "Location", 300), ("ip", "IP", 100), ("state", "Trạng thái", 110),
+                 ("hops", "Số hop", 50), ("loss", "Loss %", 70), ("avg", "Avg", 70),
                  ("worst", "Worst", 70), ("last", "Last", 70)]
         for c, t, w in heads:
             self.host_tree.heading(c, text=t)
@@ -604,8 +686,8 @@ class App(tk.Tk):
         hcols = ("nr", "host", "loss", "sent", "recv", "best", "avg", "worst", "last")
         self.hop_tree = ttk.Treeview(df, columns=hcols, show="headings", height=12)
         for c, t, w in [("nr", "Nr", 40), ("host", "Hostname", 380), ("loss", "Loss %", 70),
-                        ("sent", "Sent", 65), ("recv", "Recv", 65), ("best", "Best", 65),
-                        ("avg", "Avrg", 65), ("worst", "Wrst", 65), ("last", "Last", 65)]:
+                        ("sent", "Sent", 65), ("recv", "Receive", 65), ("best", "Best", 65),
+                        ("avg", "Avg", 65), ("worst", "Worst", 65), ("last", "Last", 65)]:
             self.hop_tree.heading(c, text=t)
             self.hop_tree.column(c, width=w, anchor="w" if c == "host" else "e")
         self.hop_tree.pack(fill="both", expand=True, side="left")
@@ -742,7 +824,7 @@ class App(tk.Tk):
                 if loss is not None:
                     tag = ("bad",) if loss >= 5 else (("warn",) if loss > 0 else ())
                 self.host_tree.item(name, tags=tag, values=(
-                    name, self.geo.get(s["ip"]), s["ip"] or "", s["state"], len(hops) or "",
+                    name, self.geo.get(s["ip"], name, dest["best"] if dest else None), s["ip"] or "", s["state"], len(hops) or "",
                     fmt(loss, 1), fmt(dest["avg"] if dest else None, 1),
                     fmt(dest["worst"] if dest else None, 1), fmt(dest["last"] if dest else None, 1)))
             self._refresh_detail()
