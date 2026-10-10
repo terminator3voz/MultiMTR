@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 MultiMTR - Giống WinMTR nhưng theo dõi NHIỀU host cùng lúc.
@@ -37,6 +37,7 @@ IS_WIN = sys.platform.startswith("win")
 APP_DIR = (os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False)
            else os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(APP_DIR, "multimtr.json")
+WARN_LOSS = 0.05    # % mất gói từ mức này trở lên -> tô vàng
 DEFAULT_HOSTS = ["192.168.1.1", "203.113.131.1", "youtube.com", "facebook.com", "voz.vn"]
 
 # Kết quả một lần probe: (kind, ip, rtt_ms)
@@ -869,7 +870,7 @@ class App(tk.Tk):
                 loss = dest["loss"] if dest else None
                 tag = ()
                 if loss is not None:
-                    tag = ("bad",) if loss >= 5 else (("warn",) if loss > 0 else ())
+                    tag = ("bad",) if loss >= 5 else (("warn",) if loss >= WARN_LOSS else ())
                 self.host_tree.item(name, tags=tag, values=(
                     name, self.geo.get(s["ip"], name, dest["best"] if dest else None, near), s["ip"] or "", s["state"], len(hops) or "",
                     fmt(loss, 1), fmt(dest["avg"] if dest else None, 1),
@@ -898,7 +899,7 @@ class App(tk.Tk):
             else:
                 shown = "No response from host"
             tag = ("silent",) if not h["ip"] else (
-                ("bad",) if h["loss"] >= 5 else (("warn",) if h["loss"] > 0 else ()))
+                ("bad",) if h["loss"] >= 5 else (("warn",) if h["loss"] >= WARN_LOSS else ()))
             vals = (i, shown, fmt(h["loss"], 1), h["sent"], h["recv"], fmt(h["best"], 1),
                     fmt(h["avg"], 1), fmt(h["worst"], 1), fmt(h["last"], 1))
             iid = "h%d" % i
