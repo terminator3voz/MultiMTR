@@ -219,6 +219,7 @@ class GeoLocator:
 
     def __init__(self):
         self.cache = {}         # ip -> "City, Country"
+        self.rdns = {}          # ip -> tên reverse DNS ("" nếu không có)
         self.coords = {}        # ip -> (lat, lon)
         self.cf = {}            # host -> mã colo Cloudflare, hoặc "" nếu không phải Cloudflare
         self.me = None          # (lat, lon) của chính máy này
@@ -226,6 +227,38 @@ class GeoLocator:
         self._retry_at = {}
         self._q = queue.Queue()
         threading.Thread(target=self._worker, daemon=True).start()
+
+    @classmethod
+    def _colo_from_name(cls, name):
+        """Rút mã sân bay (HKG, SIN...) từ reverse DNS của Google/Meta."""
+        name = (name or "").lower()
+        code = None
+        if name.endswith(".1e100.net"):                  # Google
+            first = name.split(".")[0]
+            for rx in (r"^([a-z]{3})\d+s\d+-",           # hkg07s52-in-f14
+                       r"^[a-z]{2}([a-z]{3})[a-z]?-"):   # nchkgb-am-in-f14
+                m = re.match(rx, first)
+                if m:
+                    code = m.group(1).upper()
+                    break
+        elif name.endswith(".tfbnw.net"):                # Meta/Facebook
+            m = re.search(r"\.([a-z]{3})\d+\.tfbnw\.net$", name)
+            if m:
+                code = m.group(1).upper()
+        return code if code in cls.COLOS else None
+
+    def _guess_colo(self, ip, hints):
+        """Thử rDNS của IP đích, rồi của các hop gần đích nhất."""
+        for x in (ip, *hints):
+            if self._is_local(x):
+                continue
+            if x not in self.rdns:
+                self._request(("rdns", x))
+                continue
+            c = self._colo_from_name(self.rdns[x])
+            if c:
+                return c
+        return None
 
     @staticmethod
     def _is_ip(text):
@@ -248,8 +281,9 @@ class GeoLocator:
         self._pending.add(key)
         self._q.put(key)
 
-    def get(self, ip, target=None, rtt=None):
-        """ip: IP đích; target: tên host người dùng nhập; rtt: RTT tốt nhất (ms) tới đích."""
+    def get(self, ip, target=None, rtt=None, hints=()):
+        """ip: IP đích; target: tên host người dùng nhập; rtt: RTT tốt nhất (ms) tới đích;
+        hints: IP các hop gần đích nhất (dùng khi đích không có rDNS)."""
         if not ip:
             return ""
         if self._is_local(ip):
@@ -269,6 +303,9 @@ class GeoLocator:
         if rtt is not None and self.me and ip in self.coords:
             min_rtt = _haversine_km(self.me, self.coords[ip]) / 100.0   # RTT tối thiểu theo vật lý
             if rtt < 0.8 * min_rtt:
+                colo = self._guess_colo(ip, hints)
+                if colo:
+                    return "%s (%s) - theo rDNS" % (self.COLOS[colo], colo)
                 return "Anycast/CDN (%s)" % loc
         return loc
 
@@ -284,6 +321,13 @@ class GeoLocator:
         self.cache[ip] = ", ".join(p for p in (d.get("city"), d.get("country")) if p) or "?"
         if "lat" in d and "lon" in d:
             self.coords[ip] = (d["lat"], d["lon"])
+        return True
+
+    def _do_rdns(self, ip):
+        try:
+            self.rdns[ip] = socket.gethostbyaddr(ip)[0]
+        except OSError:
+            self.rdns[ip] = ""
         return True
 
     def _do_me(self):
@@ -317,6 +361,8 @@ class GeoLocator:
                     ok = self._do_geo(key[1])
                 elif kind == "me":
                     ok = self._do_me()
+                elif kind == "rdns":
+                    ok = self._do_rdns(key[1])
                 else:
                     ok = self._do_cf(key[1])
             except Exception:  # noqa: BLE001
@@ -324,7 +370,7 @@ class GeoLocator:
             if not ok:
                 self._retry_at[key] = time.monotonic() + self.RETRY_AFTER
             self._pending.discard(key)
-            if kind != "cf":
+            if kind in ("geo", "me"):
                 time.sleep(1.4)         # giữ dưới giới hạn 45 request/phút của ip-api
 
 
@@ -663,7 +709,7 @@ class App(tk.Tk):
         hf = ttk.LabelFrame(paned, text="Các host đang theo dõi (chọn 1 dòng để xem chi tiết từng hop)")
         cols = ("host", "location", "ip", "state", "hops", "loss", "avg", "worst", "last")
         self.host_tree = ttk.Treeview(hf, columns=cols, show="headings", height=6, selectmode="extended")
-        heads = [("host", "Host", 120), ("location", "Location", 300), ("ip", "IP", 100), ("state", "Trạng thái", 110),
+        heads = [("host", "Host", 140), ("location", "Location", 240), ("ip", "IP", 120), ("state", "Trạng thái", 120),
                  ("hops", "Số hop", 50), ("loss", "Loss %", 70), ("avg", "Avg", 70),
                  ("worst", "Worst", 70), ("last", "Last", 70)]
         for c, t, w in heads:
@@ -819,12 +865,13 @@ class App(tk.Tk):
                         if h["ip"]:
                             self.resolver.get(h["ip"])
                 dest = hops[-1] if hops else None
+                near = [h["ip"] for h in reversed(hops[:-1]) if h["ip"]][:3]
                 loss = dest["loss"] if dest else None
                 tag = ()
                 if loss is not None:
                     tag = ("bad",) if loss >= 5 else (("warn",) if loss > 0 else ())
                 self.host_tree.item(name, tags=tag, values=(
-                    name, self.geo.get(s["ip"], name, dest["best"] if dest else None), s["ip"] or "", s["state"], len(hops) or "",
+                    name, self.geo.get(s["ip"], name, dest["best"] if dest else None, near), s["ip"] or "", s["state"], len(hops) or "",
                     fmt(loss, 1), fmt(dest["avg"] if dest else None, 1),
                     fmt(dest["worst"] if dest else None, 1), fmt(dest["last"] if dest else None, 1)))
             self._refresh_detail()
