@@ -10,7 +10,6 @@ MultiMTR - Giống WinMTR nhưng theo dõi NHIỀU host cùng lúc.
 Chạy:  python multimtr.py
 """
 
-import csv
 import itertools
 import json
 import os
@@ -22,9 +21,11 @@ import sys
 import threading
 import time
 import tkinter as tk
+import zipfile
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from tkinter import filedialog, messagebox, ttk
+from xml.sax.saxutils import escape as _xesc
 
 IS_WIN = sys.platform.startswith("win")
 # Khi đóng gói PyInstaller (--onefile), __file__ trỏ vào thư mục tạm bị xóa khi thoát,
@@ -164,7 +165,8 @@ class Resolver:
         self.cache = {}
         self._pending = set()
         self._q = queue.Queue()
-        threading.Thread(target=self._worker, daemon=True).start()
+        for _ in range(4):
+            threading.Thread(target=self._worker, daemon=True).start()
 
     def get(self, ip):
         if ip in self.cache:
@@ -229,6 +231,7 @@ class HostMonitor:
         self.hops = []
         self.nhops = 0
         self.history = deque(maxlen=300)    # RTT hop cuối (None = mất gói)
+        self.log = deque(maxlen=100000)     # (epoch, rtt) từng lần ping tới đích, để xuất CSV
         self._evt = None
         self.running = False
 
@@ -253,6 +256,7 @@ class HostMonitor:
             self.hops = []
             self.nhops = 0
             self.history.clear()
+            self.log.clear()
             self.ip = None
 
     def _set(self, s):
@@ -334,9 +338,15 @@ class HostMonitor:
                 self.hops.append(HopStats())
             self.hops[ttl - 1].add(rtt if kind != "timeout" else None, addr)
             if ttl == self.nhops:
-                self.history.append(rtt if kind != "timeout" else None)
+                val = rtt if kind != "timeout" else None
+                self.history.append(val)
+                self.log.append((time.time(), val))
 
     # ---- đọc dữ liệu cho GUI ----
+    def log_snapshot(self):
+        with self.lock:
+            return self.ip, list(self.log)
+
     def snapshot(self):
         with self.lock:
             return {
@@ -349,6 +359,99 @@ class HostMonitor:
 # --------------------------------------------------------------------------
 # GUI
 # --------------------------------------------------------------------------
+def _col_letter(n):
+    s = ""
+    n += 1
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def write_xlsx(path, sheets):
+    """Ghi file .xlsx tối giản. sheets = [(tên_sheet, [hàng...])]; hàng đầu là tiêu đề (in đậm)."""
+    names, used = [], set()
+    for name, *_rest in sheets:
+        base = re.sub(r"[\[\]:*?/\\]", "_", name).strip("'")[:31] or "Sheet"
+        nm, i = base, 2
+        while nm.lower() in used:
+            suf = "_%d" % i
+            nm, i = base[:31 - len(suf)] + suf, i + 1
+        used.add(nm.lower())
+        names.append(nm)
+
+    def sheet_xml(rows, widths):
+        out = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+               '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
+               'activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+               '<cols>' + "".join('<col min="%d" max="%d" width="%s" customWidth="1"/>' % (i, i, w)
+                                  for i, w in enumerate(widths, 1)) + '</cols><sheetData>']
+        for r, row in enumerate(rows, 1):
+            out.append('<row r="%d">' % r)
+            for c, v in enumerate(row):
+                if v is None or v == "":
+                    continue
+                ref = "%s%d" % (_col_letter(c), r)
+                if isinstance(v, (int, float)):
+                    out.append('<c r="%s"><v>%s</v></c>' % (ref, v))
+                else:
+                    st = ' s="1"' if r == 1 else ""
+                    out.append('<c r="%s"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
+                               % (ref, st, _xesc(str(v))))
+            out.append("</row>")
+        out.append("</sheetData></worksheet>")
+        return "".join(out)
+
+    n = len(sheets)
+    ct = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+          '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+          '<Default Extension="xml" ContentType="application/xml"/>'
+          '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+          '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+          + "".join('<Override PartName="/xl/worksheets/sheet%d.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' % i
+                    for i in range(1, n + 1))
+          + "</Types>")
+    rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            "</Relationships>")
+    wb = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+          '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+          'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>'
+          + "".join('<sheet name="%s" sheetId="%d" r:id="rId%d"/>' % (_xesc(nm, {'"': "&quot;"}), i, i)
+                    for i, nm in enumerate(names, 1))
+          + "</sheets></workbook>")
+    wb_rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+               + "".join('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet%d.xml"/>' % (i, i)
+                         for i in range(1, n + 1))
+               + '<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>' % (n + 1)
+               + "</Relationships>")
+    styles = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+              '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+              '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>'
+              '<font><b/><sz val="11"/><name val="Calibri"/></font></fonts>'
+              '<fills count="2"><fill><patternFill patternType="none"/></fill>'
+              '<fill><patternFill patternType="gray125"/></fill></fills>'
+              '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+              '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+              '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+              '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>'
+              '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+              "</styleSheet>")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", ct)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("xl/workbook.xml", wb)
+        z.writestr("xl/_rels/workbook.xml.rels", wb_rels)
+        z.writestr("xl/styles.xml", styles)
+        for i, sh in enumerate(sheets, 1):
+            widths = sh[2] if len(sh) > 2 else [24, 16, 16, 16, 16]
+            z.writestr("xl/worksheets/sheet%d.xml" % i, sheet_xml(sh[1], widths))
+
+
 def fmt(v, digits=0):
     return "-" if v is None else ("%.*f" % (digits, v))
 
@@ -397,7 +500,7 @@ class App(tk.Tk):
             ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=2)
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6)
         ttk.Button(bar, text="Copy text", command=self.copy_text).pack(side="left", padx=2)
-        ttk.Button(bar, text="Xuất CSV", command=self.export_csv).pack(side="left", padx=2)
+        ttk.Button(bar, text="Xuất log", command=self.export_log).pack(side="left", padx=2)
 
         opt = ttk.Frame(self, padding=(8, 2, 8, 6))
         opt.pack(fill="x")
@@ -428,6 +531,9 @@ class App(tk.Tk):
         sb.pack(side="right", fill="y")
         self.host_tree.configure(yscrollcommand=sb.set)
         self.host_tree.bind("<<TreeviewSelect>>", lambda _e: self._refresh_detail())
+        # bấm vào chỗ trống -> bỏ chọn (bỏ highlight)
+        self.host_tree.bind("<Button-1>", self._on_host_click, add="+")
+        self.bind_all("<ButtonPress-1>", self._on_global_click, add="+")
         self.host_tree.tag_configure("bad", background="#ffd6d6")
         self.host_tree.tag_configure("warn", background="#fff1cc")
         paned.add(hf, weight=1)
@@ -511,6 +617,23 @@ class App(tk.Tk):
         if self.host_tree.get_children() and not self.host_tree.selection():
             self.host_tree.selection_set(self.host_tree.get_children()[0])
 
+    def _on_host_click(self, event):
+        # bấm vào vùng trống của bảng (dưới các dòng) -> bỏ chọn
+        if self.host_tree.identify_region(event.x, event.y) == "nothing" \
+                and not self.host_tree.identify_row(event.y):
+            self.host_tree.selection_set(())
+            return "break"
+
+    def _on_global_click(self, event):
+        # bấm vào vùng trống của cửa sổ (frame, label, đồ thị...) -> bỏ chọn host
+        w = event.widget
+        if not isinstance(w, tk.Misc):
+            return
+        if w.winfo_class() in ("Tk", "Toplevel", "TFrame", "Frame", "TLabelframe",
+                               "TLabel", "Label", "Canvas"):
+            if self.host_tree.selection():
+                self.host_tree.selection_set(())
+
     def _selected(self):
         return [self.monitors[i] for i in self.host_tree.selection() if i in self.monitors]
 
@@ -548,6 +671,10 @@ class App(tk.Tk):
             for name, m in self.monitors.items():
                 s = m.snapshot()
                 hops = s["hops"]
+                if self.var_dns.get():
+                    for h in hops:
+                        if h["ip"]:
+                            self.resolver.get(h["ip"])
                 dest = hops[-1] if hops else None
                 loss = dest["loss"] if dest else None
                 tag = ()
@@ -644,27 +771,57 @@ class App(tk.Tk):
         self.clipboard_append(txt)
         self.status.config(text="Đã copy báo cáo vào clipboard.")
 
-    def export_csv(self):
-        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")],
-                                            initialfile="multimtr_%s.csv" % time.strftime("%Y%m%d_%H%M%S"))
+    def export_log(self):
+        """Xuất Excel: sheet 1 = Summary (thống kê từng hop), các sheet sau = log ping từng host.
+        Xuất host đang chọn, hoặc tất cả nếu không chọn gì."""
+        mons = self._selected() or list(self.monitors.values())
+        if not mons:
+            messagebox.showinfo("Xuất log", "Chưa có host nào.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")],
+            initialfile="multimtr_%s.xlsx" % time.strftime("%Y%m%d_%H%M%S"))
         if not path:
             return
         try:
-            with open(path, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.writer(f)
-                w.writerow(["target", "target_ip", "hop", "hop_ip", "hop_name", "loss_pct", "sent",
-                            "recv", "best_ms", "avg_ms", "worst_ms", "last_ms"])
-                for name, m in self.monitors.items():
-                    s = m.snapshot()
-                    for i, h in enumerate(s["hops"], 1):
-                        w.writerow([name, s["ip"], i, h["ip"] or "",
-                                    self.resolver.cache.get(h["ip"], "") if h["ip"] else "",
-                                    fmt(h["loss"], 2), h["sent"], h["recv"], fmt(h["best"], 2),
-                                    fmt(h["avg"], 2), fmt(h["worst"], 2), fmt(h["last"], 2)])
-            self.status.config(text="Đã xuất: %s" % path)
+            ips = {h["ip"] for m in mons for h in m.snapshot()["hops"] if h["ip"]}
+            missing = [ip for ip in ips if ip not in self.resolver.cache]
+            for ip in missing:
+                self.resolver.get(ip)
+            deadline = time.monotonic() + 8
+            while missing and time.monotonic() < deadline \
+                    and any(ip not in self.resolver.cache for ip in missing):
+                self.status.config(text="Đang phân giải tên hop...")
+                self.update_idletasks()
+                time.sleep(0.05)
+
+            def num(v, d):
+                return None if v is None else round(v, d)
+
+            summary = [["target", "target_ip", "hop", "hop_ip", "hop_name", "loss_pct", "sent",
+                        "recv", "best_ms", "avg_ms", "worst_ms", "last_ms"]]
+            logs, total = [], 0
+            for m in mons:
+                s = m.snapshot()
+                for i, h in enumerate(s["hops"], 1):
+                    summary.append([m.target, s["ip"] or "", i, h["ip"] or "",
+                                    self.resolver.cache.get(h["ip"], h["ip"]) if h["ip"] else "",
+                                    num(h["loss"], 2), h["sent"], h["recv"], num(h["best"], 2),
+                                    num(h["avg"], 2), num(h["worst"], 2), num(h["last"], 2)])
+                ip, log = m.log_snapshot()
+                rows = [["time", "target_ip", "status", "rtt_ms"]]
+                for ts, rtt in log:
+                    stamp = "%s.%03d" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
+                                         int((ts % 1) * 1000))
+                    rows.append([stamp, ip or "", "timeout" if rtt is None else "ok",
+                                 None if rtt is None else int(round(rtt))])
+                total += len(rows) - 1
+                logs.append((m.target, rows))
+            sheets = [("Summary", summary, [22, 16, 6, 16, 40, 10, 8, 8, 10, 10, 10, 10])] + logs
+            write_xlsx(path, sheets)
+            self.status.config(text="Đã xuất %d host (%d dòng log ping): %s" % (len(logs), total, path))
         except OSError as ex:
             messagebox.showerror("Lỗi", str(ex))
-
 
 def main():
     if IS_WIN:
