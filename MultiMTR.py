@@ -37,7 +37,7 @@ IS_WIN = sys.platform.startswith("win")
 APP_DIR = (os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False)
            else os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(APP_DIR, "multimtr.json")
-DEFAULT_HOSTS = ["192.168.1.1", "203.113.131.1", "youtube.com", "facebook.com", "voz.vn"]
+DEFAULT_HOSTS = ["192.168.1.1", "203.113.131.1", "youtube.com", "google.com", "facebook.com", "voz.vn"]
 
 # Kết quả một lần probe: (kind, ip, rtt_ms)
 #   kind: "dest" (tới đích), "hop" (TTL hết hạn tại router), "unreach", "timeout"
@@ -963,8 +963,8 @@ class App(tk.Tk):
 
     def export_log(self):
         """Xuất Excel: sheet 1 = Summary (thống kê từng hop), các sheet sau = log ping từng host.
-        Xuất host đang chọn, hoặc tất cả nếu không chọn gì."""
-        mons = self._selected() or list(self.monitors.values())
+        Luôn xuất Summary và TẤT CẢ host, không phụ thuộc host đang chọn."""
+        mons = list(self.monitors.values())
         if not mons:
             messagebox.showinfo("Xuất log", "Chưa có host nào.")
             return
