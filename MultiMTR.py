@@ -10,6 +10,7 @@ MultiMTR - Giống WinMTR nhưng theo dõi NHIỀU host cùng lúc.
 Chạy:  python multimtr.py
 """
 
+import ipaddress
 import itertools
 import json
 import os
@@ -21,6 +22,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.request
 import zipfile
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -33,7 +35,7 @@ IS_WIN = sys.platform.startswith("win")
 APP_DIR = (os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False)
            else os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(APP_DIR, "multimtr.json")
-DEFAULT_HOSTS = ["192.168.1.1", "203.113.131.1", "youtube.com", "google.com", "facebook.com", "voz.vn"]
+DEFAULT_HOSTS = ["192.168.1.1", "203.113.131.1", "youtube.com", "facebook.com", "voz.vn"]
 
 # Kết quả một lần probe: (kind, ip, rtt_ms)
 #   kind: "dest" (tới đích), "hop" (TTL hết hạn tại router), "unreach", "timeout"
@@ -184,6 +186,64 @@ class Resolver:
             except OSError:
                 name = ip
             self.cache[ip] = name
+
+
+# --------------------------------------------------------------------------
+# Tra cứu vị trí địa lý của IP (nền, có cache) - dùng ip-api.com (miễn phí, không cần key)
+# --------------------------------------------------------------------------
+class GeoLocator:
+    RETRY_AFTER = 30.0      # giây, thử lại nếu tra cứu lỗi (mất mạng, bị giới hạn 45 req/phút...)
+
+    def __init__(self):
+        self.cache = {}
+        self._pending = set()
+        self._retry_at = {}
+        self._q = queue.Queue()
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    @staticmethod
+    def _is_local(ip):
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return a.is_private or a.is_loopback or a.is_link_local
+
+    def get(self, ip):
+        if not ip:
+            return ""
+        if ip in self.cache:
+            return self.cache[ip]
+        if self._is_local(ip):
+            self.cache[ip] = "Mạng nội bộ (LAN)"
+            return self.cache[ip]
+        if ip not in self._pending and time.monotonic() >= self._retry_at.get(ip, 0):
+            self._pending.add(ip)
+            self._q.put(ip)
+        return "..."
+
+    def _lookup(self, ip):
+        url = "http://ip-api.com/json/%s?fields=status,country,regionName,city" % ip
+        with urllib.request.urlopen(url, timeout=6) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+        if d.get("status") != "success":
+            return None
+        parts = [d.get("city"), d.get("country")]
+        return ", ".join(p for p in parts if p) or d.get("regionName") or "?"
+
+    def _worker(self):
+        while True:
+            ip = self._q.get()
+            try:
+                loc = self._lookup(ip)
+            except Exception:  # noqa: BLE001
+                loc = None
+            if loc is None:
+                self._retry_at[ip] = time.monotonic() + self.RETRY_AFTER
+            else:
+                self.cache[ip] = loc
+            self._pending.discard(ip)
+            time.sleep(1.4)         # giữ dưới giới hạn 45 request/phút của ip-api
 
 
 # --------------------------------------------------------------------------
@@ -465,6 +525,7 @@ class App(tk.Tk):
         self.cfg = {"interval": 1000, "timeout": 1000, "size": 32, "maxhops": 30}
         self.monitors = {}
         self.resolver = Resolver()
+        self.geo = GeoLocator()
         self.var_dns = tk.BooleanVar(value=True)
         self.vars = {k: tk.IntVar(value=v) for k, v in self.cfg.items()}
         for k, var in self.vars.items():
@@ -518,14 +579,14 @@ class App(tk.Tk):
 
         # danh sách host
         hf = ttk.LabelFrame(paned, text="Các host đang theo dõi (chọn 1 dòng để xem chi tiết từng hop)")
-        cols = ("host", "ip", "state", "hops", "loss", "avg", "worst", "last")
+        cols = ("host", "location", "ip", "state", "hops", "loss", "avg", "worst", "last")
         self.host_tree = ttk.Treeview(hf, columns=cols, show="headings", height=6, selectmode="extended")
-        heads = [("host", "Host", 220), ("ip", "IP", 130), ("state", "Trạng thái", 150),
+        heads = [("host", "Host", 130), ("location", "Location", 200), ("ip", "IP", 130), ("state", "Trạng thái", 150),
                  ("hops", "Số hop", 60), ("loss", "Loss % (đích)", 100), ("avg", "Avg", 70),
                  ("worst", "Worst", 70), ("last", "Last", 70)]
         for c, t, w in heads:
             self.host_tree.heading(c, text=t)
-            self.host_tree.column(c, width=w, anchor="w" if c in ("host", "ip", "state") else "e")
+            self.host_tree.column(c, width=w, anchor="w" if c in ("host", "location", "ip", "state") else "e")
         self.host_tree.pack(fill="both", expand=True, side="left")
         sb = ttk.Scrollbar(hf, command=self.host_tree.yview)
         sb.pack(side="right", fill="y")
@@ -606,7 +667,7 @@ class App(tk.Tk):
             return
         m = HostMonitor(name, self.cfg)
         self.monitors[name] = m
-        self.host_tree.insert("", "end", iid=name, values=(name, "", "Chờ", "", "", "", "", ""))
+        self.host_tree.insert("", "end", iid=name, values=(name, "", "", "Chờ", "", "", "", "", ""))
         if autostart:
             m.start()
 
@@ -681,7 +742,7 @@ class App(tk.Tk):
                 if loss is not None:
                     tag = ("bad",) if loss >= 5 else (("warn",) if loss > 0 else ())
                 self.host_tree.item(name, tags=tag, values=(
-                    name, s["ip"] or "", s["state"], len(hops) or "",
+                    name, self.geo.get(s["ip"]), s["ip"] or "", s["state"], len(hops) or "",
                     fmt(loss, 1), fmt(dest["avg"] if dest else None, 1),
                     fmt(dest["worst"] if dest else None, 1), fmt(dest["last"] if dest else None, 1)))
             self._refresh_detail()
@@ -806,15 +867,15 @@ class App(tk.Tk):
                 for i, h in enumerate(s["hops"], 1):
                     summary.append([m.target, s["ip"] or "", i, h["ip"] or "",
                                     self.resolver.cache.get(h["ip"], h["ip"]) if h["ip"] else "",
-                                    num(h["loss"], 2), h["sent"], h["recv"], num(h["best"], 2),
-                                    num(h["avg"], 2), num(h["worst"], 2), num(h["last"], 2)])
+                                    num(h["loss"], 1), h["sent"], h["recv"], num(h["best"], 1),
+                                    num(h["avg"], 1), num(h["worst"], 1), num(h["last"], 1)])
                 ip, log = m.log_snapshot()
                 rows = [["time", "target_ip", "status", "rtt_ms"]]
                 for ts, rtt in log:
                     stamp = "%s.%03d" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
                                          int((ts % 1) * 1000))
                     rows.append([stamp, ip or "", "timeout" if rtt is None else "ok",
-                                 None if rtt is None else int(round(rtt))])
+                                 None if rtt is None else round(rtt,1)])
                 total += len(rows) - 1
                 logs.append((m.target, rows))
             sheets = [("Summary", summary, [22, 16, 6, 16, 40, 10, 8, 8, 10, 10, 10, 10])] + logs
