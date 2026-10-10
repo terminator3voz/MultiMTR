@@ -18,7 +18,7 @@ Traceroute + continuous ping with per-hop loss and latency statistics, a live la
 - Tô màu hop mất gói (vàng khi có loss, đỏ từ 5% trở lên).
 - Phân giải tên ngược (DNS) chạy nền, bật/tắt được.
 - Chạy, dừng, xóa, trace lại cho từng host hoặc tất cả.
-- **Copy text** báo cáo và **Xuất CSV**.
+- **Copy text** báo cáo và **Xuất log**.
 - Chu kỳ, timeout, kích thước gói, max hops chỉnh được ngay khi đang chạy.
 - Tự lưu danh sách host và cấu hình vào `multimtr.json` khi đóng app.
 
