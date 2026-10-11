@@ -10,6 +10,7 @@ MultiMTR - Giống WinMTR nhưng theo dõi NHIỀU host cùng lúc.
 Chạy:  python multimtr.py
 """
 
+import bisect
 import ipaddress
 import itertools
 import json
@@ -26,6 +27,7 @@ import tkinter as tk
 import urllib.error
 import urllib.request
 import zipfile
+import zlib
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from tkinter import filedialog, messagebox, ttk
@@ -645,6 +647,605 @@ def fmt(v, digits=0):
     return "-" if v is None else ("%.*f" % (digits, v))
 
 
+# --------------------------------------------------------------------------
+# Xuất biểu đồ RTT ra ảnh PNG (chỉ dùng thư viện chuẩn: zlib + struct, tự vẽ)
+# --------------------------------------------------------------------------
+_FONT_5X7 = {
+    "A": "01110|10001|10001|11111|10001|10001|10001", "B": "11110|10001|10001|11110|10001|10001|11110",
+    "C": "01110|10001|10000|10000|10000|10001|01110", "D": "11110|10001|10001|10001|10001|10001|11110",
+    "E": "11111|10000|10000|11110|10000|10000|11111", "F": "11111|10000|10000|11110|10000|10000|10000",
+    "G": "01110|10001|10000|10111|10001|10001|01111", "H": "10001|10001|10001|11111|10001|10001|10001",
+    "I": "01110|00100|00100|00100|00100|00100|01110", "J": "00111|00010|00010|00010|00010|10010|01100",
+    "K": "10001|10010|10100|11000|10100|10010|10001", "L": "10000|10000|10000|10000|10000|10000|11111",
+    "M": "10001|11011|10101|10101|10001|10001|10001", "N": "10001|11001|10101|10011|10001|10001|10001",
+    "O": "01110|10001|10001|10001|10001|10001|01110", "P": "11110|10001|10001|11110|10000|10000|10000",
+    "Q": "01110|10001|10001|10001|10101|10010|01101", "R": "11110|10001|10001|11110|10100|10010|10001",
+    "S": "01111|10000|10000|01110|00001|00001|11110", "T": "11111|00100|00100|00100|00100|00100|00100",
+    "U": "10001|10001|10001|10001|10001|10001|01110", "V": "10001|10001|10001|10001|10001|01010|00100",
+    "W": "10001|10001|10001|10101|10101|10101|01010", "X": "10001|10001|01010|00100|01010|10001|10001",
+    "Y": "10001|10001|01010|00100|00100|00100|00100", "Z": "11111|00001|00010|00100|01000|10000|11111",
+    "0": "01110|10001|10011|10101|11001|10001|01110", "1": "00100|01100|00100|00100|00100|00100|01110",
+    "2": "01110|10001|00001|00010|00100|01000|11111", "3": "11110|00001|00001|01110|00001|00001|11110",
+    "4": "00010|00110|01010|10010|11111|00010|00010", "5": "11111|10000|11110|00001|00001|10001|01110",
+    "6": "00110|01000|10000|11110|10001|10001|01110", "7": "11111|00001|00010|00100|01000|01000|01000",
+    "8": "01110|10001|10001|01110|10001|10001|01110", "9": "01110|10001|10001|01111|00001|00010|01100",
+    ".": "00000|00000|00000|00000|00000|01100|01100", ",": "00000|00000|00000|00000|01100|00100|01000",
+    ":": "00000|01100|01100|00000|01100|01100|00000", "-": "00000|00000|00000|11111|00000|00000|00000",
+    "(": "00010|00100|01000|01000|01000|00100|00010", ")": "01000|00100|00010|00010|00010|00100|01000",
+    "%": "11001|11010|00010|00100|01000|01011|10011", "/": "00001|00010|00010|00100|01000|01000|10000",
+    "_": "00000|00000|00000|00000|00000|00000|11111", " ": "00000|00000|00000|00000|00000|00000|00000",
+    "?": "01110|10001|00001|00010|00100|00000|00100",
+}
+_FONT_5X7 = {k: v.split("|") for k, v in _FONT_5X7.items()}
+
+
+class _Img:
+    """Ảnh RGB tối giản: vẽ chữ bitmap, đường thẳng khử răng cưa, lưu PNG."""
+
+    def __init__(self, w, h, bg=(255, 255, 255)):
+        self.w, self.h = w, h
+        self.buf = bytearray(bytes(bg) * (w * h))
+
+    def px(self, x, y, col, a=1.0):
+        if 0 <= x < self.w and 0 <= y < self.h and a > 0:
+            i = (y * self.w + x) * 3
+            b = self.buf
+            if a >= 1.0:
+                b[i], b[i + 1], b[i + 2] = col
+            else:
+                b[i] = int(b[i] + (col[0] - b[i]) * a)
+                b[i + 1] = int(b[i + 1] + (col[1] - b[i + 1]) * a)
+                b[i + 2] = int(b[i + 2] + (col[2] - b[i + 2]) * a)
+
+    def rect(self, x0, y0, x1, y1, col):
+        x0, x1 = max(0, int(x0)), min(self.w - 1, int(x1))
+        for y in range(max(0, int(y0)), min(self.h - 1, int(y1)) + 1):
+            i = (y * self.w + x0) * 3
+            self.buf[i:i + (x1 - x0 + 1) * 3] = bytes(col) * (x1 - x0 + 1)
+
+    def hline(self, x0, x1, y, col):
+        self.rect(x0, y, x1, y, col)
+
+    def vline(self, x, y0, y1, col):
+        self.rect(x, y0, x, y1, col)
+
+    def line(self, x0, y0, x1, y1, col):
+        """Đường Wu (khử răng cưa)."""
+        steep = abs(y1 - y0) > abs(x1 - x0)
+        if steep:
+            x0, y0, x1, y1 = y0, x0, y1, x1
+        if x0 > x1:
+            x0, y0, x1, y1 = x1, y1, x0, y0
+        dx = x1 - x0
+        grad = (y1 - y0) / dx if dx > 1e-9 else 0.0
+        for x in range(int(math.floor(x0)), int(math.floor(x1)) + 1):
+            y = y0 + grad * (x - x0) if dx > 1e-9 else y0
+            yi = int(math.floor(y))
+            f = y - yi
+            if steep:
+                self.px(yi, x, col, 1 - f)
+                self.px(yi + 1, x, col, f)
+            else:
+                self.px(x, yi, col, 1 - f)
+                self.px(x, yi + 1, col, f)
+
+    def text(self, x, y, s, col, scale=2, anchor="l"):
+        s = str(s).upper()
+        width = len(s) * 6 * scale - scale
+        if anchor == "r":
+            x -= width
+        elif anchor == "c":
+            x -= width // 2
+        for ch in s:
+            rows = _FONT_5X7.get(ch, _FONT_5X7["?"])
+            for ry, row in enumerate(rows):
+                for rx, bit in enumerate(row):
+                    if bit == "1":
+                        self.rect(x + rx * scale, y + ry * scale,
+                                  x + rx * scale + scale - 1, y + ry * scale + scale - 1, col)
+            x += 6 * scale
+
+    def save_png(self, path):
+        raw = bytearray()
+        stride = self.w * 3
+        for y in range(self.h):
+            raw.append(0)
+            raw += self.buf[y * stride:(y + 1) * stride]
+
+        def chunk(tag, data):
+            c = struct.pack(">I", len(data)) + tag + data
+            return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+        with open(path, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n")
+            f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", self.w, self.h, 8, 2, 0, 0, 0)))
+            f.write(chunk(b"IDAT", zlib.compress(bytes(raw), 6)))
+            f.write(chunk(b"IEND", b""))
+
+
+def _nice_step(span, want=4):
+    raw = span / want
+    mag = 10 ** math.floor(math.log10(raw)) if raw > 0 else 1
+    for m in (1, 2, 2.5, 5, 10):
+        if raw <= m * mag:
+            return m * mag
+    return 10 * mag
+
+
+def render_rtt_png(path, series, width=1800):
+    """series = [(tên_host, ip, [(epoch, rtt_ms|None), ...]), ...]
+    Mỗi host một khung: đường RTT (xanh), dấu x đỏ = gói timeout, chung trục thời gian."""
+    BG, GRID, AXIS = (255, 255, 255), (228, 232, 236), (90, 98, 108)
+    LINE, RED, TXT, TITLE = (43, 108, 176), (197, 48, 48), (70, 78, 88), (31, 58, 95)
+    left, right, top = 100, 30, 24
+    ph, title_h, gap, bottom = 170, 30, 22, 34
+    n = len(series)
+    height = top + n * (title_h + ph + gap) + bottom
+    img = _Img(width, height, BG)
+    pw = width - left - right
+
+    stamps = [t for _, _, log in series for t, _ in log]
+    t0, t1 = min(stamps), max(stamps)
+    span = max(t1 - t0, 1.0)
+    # bước chia trục thời gian
+    ivs = (60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400)
+    iv = next((v for v in ivs if span / v <= 10), ivs[-1])
+    off = time.localtime(t0).tm_gmtoff or 0
+    ticks, t = [], math.ceil((t0 + off) / iv) * iv - off
+    while t <= t1:
+        ticks.append(t)
+        t += iv
+    tfmt = "%H:%M"
+
+    def xpos(ts):
+        return left + (ts - t0) / span * (pw - 1)
+
+    for idx, (name, ip, log) in enumerate(series):
+        y0 = top + idx * (title_h + ph + gap) + title_h        # đỉnh khung vẽ
+        y1 = y0 + ph - 1
+        oks = [(ts, v) for ts, v in log if v is not None]
+        lost = [ts for ts, v in log if v is None]
+        vmax = max((v for _, v in oks), default=10.0)
+        step = _nice_step(max(vmax * 1.08, 5.0))
+        ymax = math.ceil(vmax * 1.08 / step) * step
+        ymax = max(ymax, step)
+
+        def ypos(v):
+            return y1 - (v / ymax) * (ph - 1)
+
+        # tiêu đề (tên host)
+        img.text(left, y0 - 24, name, TITLE, 2)
+        # lưới ngang + nhãn Y
+        v = 0.0
+        while v <= ymax + 1e-9:
+            yy = int(round(ypos(v)))
+            img.hline(left, left + pw, yy, GRID)
+            lab = "%d" % round(v) if step >= 1 else "%.1f" % v
+            img.text(left - 8, yy - 7, lab, AXIS, 2, anchor="r")
+            v += step
+        # lưới dọc
+        for tk_ in ticks:
+            img.vline(int(xpos(tk_)), y0, y1, GRID)
+        img.vline(left, y0, y1, AXIS)
+        img.hline(left, left + pw, y1, AXIS)
+        img.text(10, y0 + ph // 2 - 7, "MS", AXIS, 2)
+
+        # đường RTT; nếu quá dày thì gộp theo cột pixel (first/min/max/last)
+        pts = [(xpos(ts), ypos(v), v) for ts, v in oks]
+        if len(pts) > 3 * pw:
+            cols = {}
+            for p in pts:
+                cols.setdefault(int(p[0]), []).append(p)
+            pts = []
+            for cx in sorted(cols):
+                c = cols[cx]
+                lo, hi = min(c, key=lambda q: q[2]), max(c, key=lambda q: q[2])
+                seq = [c[0], lo, hi, c[-1]]
+                for q in seq:
+                    if not pts or pts[-1] is not q:
+                        pts.append(q)
+        for a, b in zip(pts, pts[1:]):
+            img.line(a[0], a[1], b[0], b[1], LINE)
+        # dấu x đỏ cho timeout (sát đỉnh khung)
+        seen = set()
+        for ts in lost:
+            x = int(round(xpos(ts)))
+            if x in seen:
+                continue
+            seen.add(x)
+            for d in range(-3, 4):
+                img.px(x + d, y0 + 6 + d, RED)
+                img.px(x + d, y0 + 6 - d, RED)
+
+    # nhãn thời gian ở đáy
+    yb = top + n * (title_h + ph + gap) - gap + 8
+    for tk_ in ticks:
+        img.text(int(xpos(tk_)), yb, time.strftime(tfmt, time.localtime(tk_)), AXIS, 2, anchor="c")
+    img.save_png(path)
+
+
+# --------------------------------------------------------------------------
+# Phân tích thống kê từng host (dùng cho ảnh thống kê)
+# --------------------------------------------------------------------------
+SPIKE_MS = 20.0        # spike = RTT cao hơn trung vị trượt quanh nó quá ngần này (ms)
+EVENT_GAP_S = 30.0     # các spike/timeout cách nhau <= ngần này giây thuộc cùng một sự kiện
+
+
+def _f1(v, d=1):
+    return "-" if v is None else ("%.*f" % (d, v)).replace(".", ",")
+
+
+def _is_private(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+        return a.is_private or a.is_loopback or a.is_link_local
+    except ValueError:
+        return False
+
+
+def _pctl(sv, p):
+    if not sv:
+        return None
+    k = (len(sv) - 1) * p / 100.0
+    f = int(math.floor(k))
+    c = min(f + 1, len(sv) - 1)
+    return sv[f] + (sv[c] - sv[f]) * (k - f)
+
+
+def _rolling_median(vals, win):
+    n = len(vals)
+    half = win // 2
+    out = [0.0] * n
+    if not n:
+        return out
+    hi = min(n, half + 1)
+    w = sorted(vals[:hi])
+    lo = 0
+    for i in range(n):
+        want_lo, want_hi = max(0, i - half), min(n, i + half + 1)
+        while hi < want_hi:
+            bisect.insort(w, vals[hi])
+            hi += 1
+        while lo < want_lo:
+            w.pop(bisect.bisect_left(w, vals[lo]))
+            lo += 1
+        m = len(w)
+        out[i] = w[m // 2] if m % 2 else (w[m // 2 - 1] + w[m // 2]) / 2.0
+    return out
+
+
+RATINGS = ["Rất kém", "Kém", "Khá", "Tốt", "Rất tốt"]
+RATING_FILL = {"Rất tốt": (224, 242, 228), "Tốt": (224, 242, 228), "Khá": (255, 243, 205),
+               "Kém": (248, 215, 218), "Rất kém": (248, 215, 218), "Chưa đủ dữ liệu": (238, 238, 238)}
+
+
+def _analyze_host(h, interval_ms):
+    log = h["log"]
+    oks = [(t, v) for t, v in log if v is not None]
+    lost = [t for t, v in log if v is None]
+    n = len(log)
+    st = {"target": h["target"], "ip": h.get("ip") or "", "n": n, "lost": len(lost),
+          "loss": 100.0 * len(lost) / n if n else 0.0, "local": _is_private(h.get("ip") or "")}
+    times = [t for t, _ in oks]
+    vals = [v for _, v in oks]
+    sv = sorted(vals)
+    st.update(avg=(sum(vals) / len(vals)) if vals else None, med=_pctl(sv, 50), p95=_pctl(sv, 95),
+              p99=_pctl(sv, 99), max=sv[-1] if sv else None, min=sv[0] if sv else None)
+    diffs = [abs(b[1] - a[1]) for a, b in zip(log, log[1:]) if a[1] is not None and b[1] is not None]
+    st["jitter"] = sum(diffs) / len(diffs) if diffs else None
+    win = max(11, min(121, int(round(60000.0 / max(interval_ms, 1))))) | 1
+    base = _rolling_median(vals, win)
+    spikes = [(times[i], vals[i], vals[i] - base[i]) for i in range(len(vals)) if vals[i] - base[i] > SPIKE_MS]
+    st["spikes"] = spikes
+    st["spike_pct"] = 100.0 * len(spikes) / len(vals) if vals else 0.0
+    # mức nền theo cửa sổ 5 phút
+    groups = {}
+    if times:
+        t0 = times[0]
+        for t, v in oks:
+            groups.setdefault(int((t - t0) // 300), []).append(v)
+    meds = [_pctl(sorted(g), 50) for g in groups.values() if len(g) >= 30]
+    st["base_min"], st["base_max"] = (min(meds), max(meds)) if meds else (None, None)
+    st["base_shift"] = bool(meds) and (max(meds) - min(meds) >= 8.0) and max(meds) >= 1.3 * min(meds)
+    # sự kiện (cụm spike/timeout)
+    bad = sorted([(t, "t", 0.0) for t in lost] + [(t, "s", ex) for t, _, ex in spikes])
+    clusters, cur = [], []
+    for b in bad:
+        if cur and b[0] - cur[-1][0] > EVENT_GAP_S:
+            clusters.append(cur)
+            cur = []
+        cur.append(b)
+    if cur:
+        clusters.append(cur)
+    events = []
+    med = st["med"] or 0.0
+    for c in clusters:
+        s0, s1 = c[0][0], c[-1][0]
+        to = sum(1 for x in c if x[1] == "t")
+        pex = max((x[2] for x in c), default=0.0)
+        i0, i1 = bisect.bisect_left(times, s0), bisect.bisect_right(times, s1)
+        seg = vals[i0:i1]
+        peak = max(seg) if seg else None
+        winloss = to / float(len(seg) + to) if (len(seg) + to) else 0.0
+        severe = (peak is not None and peak >= 100 and peak >= 3 * med) or (to >= 5 and winloss >= 0.05)
+        sig = severe or to >= 3 or pex >= 50 or (len(c) >= 10 and pex >= 30)
+        level = "Nghiêm trọng" if severe else ("Trung bình" if (to >= 3 or pex >= 50) else "Nhẹ")
+        events.append({"start": s0, "end": s1, "n": len(c), "timeouts": to, "peak": peak, "pex": pex,
+                       "avg": (sum(seg) / len(seg)) if seg else None, "severe": severe, "sig": sig,
+                       "level": level, "winloss": winloss * 100.0})
+    st["events"] = events
+    st["sig_events"] = [e for e in events if e["sig"]]
+    st["has_severe"] = any(e["severe"] for e in events)
+    # đánh giá
+    if n < 30:
+        st["rating"] = "Chưa đủ dữ liệu"
+    elif st["loss"] > 5:
+        st["rating"] = "Rất kém"
+    elif st["loss"] > 1:
+        st["rating"] = "Kém"
+    elif st["has_severe"] or st["loss"] > 0.1:
+        st["rating"] = "Khá"
+    elif st["loss"] <= 0.05 and st["spike_pct"] <= 0.5:
+        st["rating"] = "Rất tốt"
+    else:
+        st["rating"] = "Tốt"
+    return st
+
+
+
+# --------------------------------------------------------------------------
+# Xuất ảnh thống kê (bảng) ra PNG
+# Vẽ chữ có dấu tiếng Việt bằng: GDI (Windows) -> Pillow (nếu có) -> font bitmap (không dấu)
+# --------------------------------------------------------------------------
+class _GdiText:
+    """Vẽ chữ bằng GDI của Windows (Arial) vào DIB 32-bit, trả về mặt nạ alpha 8-bit."""
+
+    def __init__(self):
+        if not IS_WIN:
+            raise OSError("not windows")
+        from ctypes import wintypes
+        self.wt = wintypes
+        g = ctypes.WinDLL("gdi32", use_last_error=True)
+        self.g = g
+        V = ctypes.c_void_p
+        g.CreateCompatibleDC.restype, g.CreateCompatibleDC.argtypes = V, [V]
+        g.DeleteDC.argtypes = [V]
+        g.CreateFontW.restype = V
+        g.CreateFontW.argtypes = [ctypes.c_int] * 5 + [ctypes.c_ulong] * 8 + [ctypes.c_wchar_p]
+        g.SelectObject.restype, g.SelectObject.argtypes = V, [V, V]
+        g.DeleteObject.argtypes = [V]
+        g.GetTextExtentPoint32W.argtypes = [V, ctypes.c_wchar_p, ctypes.c_int, ctypes.c_void_p]
+        g.CreateDIBSection.restype = V
+        g.CreateDIBSection.argtypes = [V, ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(V), V, ctypes.c_uint]
+        g.SetBkMode.argtypes = [V, ctypes.c_int]
+        g.SetBkColor.argtypes = [V, ctypes.c_ulong]
+        g.SetTextColor.argtypes = [V, ctypes.c_ulong]
+        g.TextOutW.argtypes = [V, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p, ctypes.c_int]
+        g.GdiFlush.argtypes = []
+        self.hdc = g.CreateCompatibleDC(None)
+        if not self.hdc:
+            raise OSError("CreateCompatibleDC")
+        self.fonts = {}
+        self.render("Ag", 15, False)           # thử một lần, lỗi thì chuyển sang backend khác
+
+    def _font(self, px, bold):
+        key = (px, bold)
+        if key not in self.fonts:
+            f = self.g.CreateFontW(-px, 0, 0, 0, 700 if bold else 400, 0, 0, 0, 1, 0, 0, 4, 0, "Arial")
+            if not f:
+                raise OSError("CreateFontW")
+            self.fonts[key] = f
+        return self.fonts[key]
+
+    def render(self, text, px, bold):
+        g = self.g
+        old = g.SelectObject(self.hdc, self._font(px, bold))
+        try:
+            sz = (ctypes.c_long * 2)()
+            g.GetTextExtentPoint32W(self.hdc, text, len(text), ctypes.byref(sz))
+            w, h = max(1, sz[0] + 2), max(1, int(px * 1.3) + 1)
+
+            class BIH(ctypes.Structure):
+                _fields_ = [("biSize", ctypes.c_ulong), ("biWidth", ctypes.c_long), ("biHeight", ctypes.c_long),
+                            ("biPlanes", ctypes.c_ushort), ("biBitCount", ctypes.c_ushort),
+                            ("biCompression", ctypes.c_ulong), ("biSizeImage", ctypes.c_ulong),
+                            ("biXPelsPerMeter", ctypes.c_long), ("biYPelsPerMeter", ctypes.c_long),
+                            ("biClrUsed", ctypes.c_ulong), ("biClrImportant", ctypes.c_ulong)]
+
+            bmi = BIH(ctypes.sizeof(BIH), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+            bits = ctypes.c_void_p()
+            bmp = g.CreateDIBSection(self.hdc, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+            if not bmp or not bits.value:
+                raise OSError("CreateDIBSection")
+            oldbmp = g.SelectObject(self.hdc, bmp)
+            try:
+                ctypes.memset(bits, 0, w * h * 4)
+                g.SetBkMode(self.hdc, 2)               # OPAQUE
+                g.SetBkColor(self.hdc, 0x000000)
+                g.SetTextColor(self.hdc, 0xFFFFFF)
+                g.TextOutW(self.hdc, 0, 0, text, len(text))
+                g.GdiFlush()
+                raw = ctypes.string_at(bits.value, w * h * 4)
+            finally:
+                g.SelectObject(self.hdc, oldbmp)
+                g.DeleteObject(bmp)
+            return w, h, bytes(raw[1::4])               # kênh G của BGRA = độ phủ chữ
+        finally:
+            g.SelectObject(self.hdc, old)
+
+
+class _PilText:
+    def __init__(self):
+        from PIL import Image, ImageDraw, ImageFont
+        self.Image, self.ImageDraw, self.ImageFont = Image, ImageDraw, ImageFont
+        self.fonts = {}
+        self.render("Ag", 15, False)
+
+    def _font(self, px, bold):
+        key = (px, bold)
+        if key not in self.fonts:
+            names = (["arialbd.ttf", "Arial Bold.ttf", "LiberationSans-Bold.ttf", "DejaVuSans-Bold.ttf"] if bold
+                     else ["arial.ttf", "Arial.ttf", "LiberationSans-Regular.ttf", "DejaVuSans.ttf"])
+            font = None
+            for nm in names:
+                try:
+                    font = self.ImageFont.truetype(nm, px)
+                    break
+                except OSError:
+                    continue
+            if font is None:
+                raise OSError("no TTF font")
+            self.fonts[key] = font
+        return self.fonts[key]
+
+    def render(self, text, px, bold):
+        f = self._font(px, bold)
+        w, h = int(f.getlength(text)) + 3, int(px * 1.3) + 1
+        im = self.Image.new("L", (w, h), 0)
+        self.ImageDraw.Draw(im).text((0, 0), text, font=f, fill=255)
+        return w, h, im.tobytes()
+
+
+class _BitmapText:
+    """Dự phòng cuối: font 5x7 tự vẽ, không có dấu, chỉ chữ HOA."""
+
+    def render(self, text, px, bold):
+        import unicodedata
+        s = unicodedata.normalize("NFD", str(text).replace("Đ", "D").replace("đ", "d"))
+        s = "".join(c for c in s if not unicodedata.combining(c)).upper()
+        sc = max(1, int(round(px / 9.0)))
+        w, h = max(1, len(s) * 6 * sc), int(px * 1.3) + 1
+        buf = bytearray(w * h)
+        x0 = 0
+        y0 = max(0, (px - 7 * sc) // 2 + sc)
+        for ch in s:
+            for ry, row in enumerate(_FONT_5X7.get(ch, _FONT_5X7["?"])):
+                for rx, bit in enumerate(row):
+                    if bit == "1":
+                        for dy in range(sc):
+                            for dx in range(sc):
+                                xx, yy = x0 + rx * sc + dx, y0 + ry * sc + dy
+                                if 0 <= xx < w and 0 <= yy < h:
+                                    buf[yy * w + xx] = 255
+            x0 += 6 * sc
+        return w, h, bytes(buf)
+
+
+class _TextEngine:
+    def __init__(self):
+        self.impl = None
+        for cls in (_GdiText, _PilText):
+            try:
+                self.impl = cls()
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        if self.impl is None:
+            self.impl = _BitmapText()
+        self.cache = {}
+
+    def mask(self, text, px, bold=False):
+        key = (text, px, bold)
+        if key not in self.cache:
+            self.cache[key] = self.impl.render(text, px, bold)
+        return self.cache[key]
+
+    def width(self, text, px, bold=False):
+        return self.mask(text, px, bold)[0] - 2
+
+
+def _blit_mask(img, x, y, mask, col):
+    w, h, alpha = mask
+    for j in range(h):
+        row = j * w
+        for i in range(w):
+            a = alpha[row + i]
+            if a:
+                img.px(x + i, y + j, col, a / 255.0)
+
+
+def _wrap_cell(eng, text, px, bold, avail):
+    """Ngắt dòng theo từ cho vừa chiều rộng ô (giống bảng HTML)."""
+    words, lines, cur = str(text).split(" "), [], ""
+    for wd in words:
+        trial = wd if not cur else cur + " " + wd
+        if cur and eng.width(trial, px, bold) > avail:
+            lines.append(cur)
+            cur = wd
+        else:
+            cur = trial
+    lines.append(cur)
+    return lines
+
+
+def render_stats_png(path, hosts, interval_ms):
+    """Ảnh bảng thống kê: Host | IP | Mẫu | Mất gói | RTT TB | Max | Ping Spike | Jitter | Đánh giá.
+    hosts = [{target, ip, log:[(epoch, rtt|None)]}]. Giao diện theo ảnh mẫu (vẽ ở độ phân giải x3)."""
+    S = 3                                           # hệ số phóng (càng lớn ảnh càng nét)
+    FONT = 15 * S
+    PAD, LINE_H, CELL_PAD = 8 * S, 21 * S, 8 * S
+    NAVY, BORDER, ZEBRA, TXT = (31, 58, 95), (197, 198, 200), (245, 246, 248), (33, 37, 41)
+    heads = ["Host", "IP", "Mẫu", "Mất gói", "RTT TB", "Max", "Ping Spike", "Jitter", "Đánh giá"]
+    base_w = [117, 133, 58, 67, 63, 58, 58, 59, 124]         # độ rộng cột theo ảnh mẫu (px gốc)
+    eng = _TextEngine()
+
+    rows = []
+    for h in hosts:
+        a = _analyze_host(h, interval_ms)
+        if a["n"] < 2:
+            continue
+        rows.append([a["target"], a["ip"] or "-", str(a["n"]), _f1(a["loss"], 2) + "%", _f1(a["avg"]),
+                     _f1(a["max"]), str(len(a["spikes"])), _f1(a["jitter"]), a["rating"]])
+    if not rows:
+        raise ValueError("Chưa có dữ liệu ping.")
+
+    # độ rộng cột: không nhỏ hơn mẫu, tự nở ra nếu nội dung dài (tên host dài...)
+    widths = []
+    for c in range(len(heads)):
+        need = max(eng.width(r[c], FONT, c == 8) for r in rows) + 2 * PAD + 2 * S
+        widths.append(max(base_w[c] * S, need))
+    # ô tiêu đề được ngắt dòng theo độ rộng cột
+    hlines = [_wrap_cell(eng, t, FONT, True, widths[c] - 2 * PAD) for c, t in enumerate(heads)]
+    head_h = (8 * S) + LINE_H * max(len(x) for x in hlines)
+    row_h = 8 * S + LINE_H
+
+    mx, my = 2 * S, 2 * S
+    tw = sum(widths)
+    W = mx + tw + 4 * S
+    H = my + head_h + S + len(rows) * (row_h + S) + 2 * S
+    img = _Img(W, H, (255, 255, 255))
+    xs = [mx]
+    for w in widths:
+        xs.append(xs[-1] + w)
+
+    # tiêu đề
+    img.rect(mx, my, xs[-1], my + head_h - 1, NAVY)
+    for x in xs:                                    # vạch dọc trắng phân tách các cột tiêu đề
+        img.rect(x - S // 2, my, x - S // 2 + S - 1, my + head_h - 1, (255, 255, 255))
+    for c, lines in enumerate(hlines):
+        for k, ln in enumerate(lines):
+            _blit_mask(img, xs[c] + PAD, my + 4 * S + k * LINE_H, eng.mask(ln, FONT, True), (255, 255, 255))
+
+    # dữ liệu
+    y = my + head_h
+    img.rect(mx, y, xs[-1], y + S - 1, BORDER)
+    y += S
+    for ri, r in enumerate(rows):
+        top = y
+        bot = top + row_h - 1
+        if ri % 2:
+            img.rect(mx, top, xs[-1], bot, ZEBRA)
+        fill = RATING_FILL.get(r[8], (238, 238, 238))
+        img.rect(xs[8], top, xs[9], bot, fill)
+        for c, txt in enumerate(r):
+            _blit_mask(img, xs[c] + PAD, top + 4 * S, eng.mask(txt, FONT, c == 8), TXT)
+        img.rect(mx, bot + 1, xs[-1], bot + S, BORDER)
+        y = bot + 1 + S
+    for x in xs:
+        img.rect(x - S // 2, my + head_h, x - S // 2 + S - 1, y - 1, BORDER)
+    img.save_png(path)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -691,6 +1292,7 @@ class App(tk.Tk):
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6)
         ttk.Button(bar, text="Copy text", command=self.copy_text).pack(side="left", padx=2)
         ttk.Button(bar, text="Xuất log", command=self.export_log).pack(side="left", padx=2)
+        ttk.Button(bar, text="Xuất biểu đồ RTT", command=self.export_chart).pack(side="left", padx=2)
 
         opt = ttk.Frame(self, padding=(8, 2, 8, 6))
         opt.pack(fill="x")
@@ -1013,6 +1615,36 @@ class App(tk.Tk):
             self.status.config(text="Đã xuất %d host (%d dòng log ping): %s" % (len(logs), total, path))
         except OSError as ex:
             messagebox.showerror("Lỗi", str(ex))
+
+    def export_chart(self):
+        """Luôn xuất TOÀN BỘ host (không phụ thuộc host đang chọn), ra 2 file ảnh PNG:
+        1) biểu đồ RTT theo thời gian; 2) ảnh bảng thống kê (cùng tên, thêm hậu tố _thongke)."""
+        series, stats = [], []
+        for m in list(self.monitors.values()):
+            ip, log = m.log_snapshot()
+            if len(log) >= 2:
+                series.append((m.target, ip, log))
+                stats.append({"target": m.target, "ip": ip, "log": log})
+        if not series:
+            messagebox.showinfo("Xuất biểu đồ RTT", "Chưa có dữ liệu ping. Hãy chạy theo dõi một lúc rồi thử lại.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".png", filetypes=[("Ảnh PNG", "*.png")],
+            initialfile="rtt_%s.png" % time.strftime("%Y%m%d_%H%M%S"))
+        if not path:
+            return
+        root, ext = os.path.splitext(path)
+        stats_path = root + "_thongke" + (ext or ".png")
+        try:
+            self.status.config(text="Đang vẽ biểu đồ và bảng thống kê...")
+            self.update_idletasks()
+            render_rtt_png(path, series)
+            render_stats_png(stats_path, stats, self.cfg["interval"])
+            self.status.config(text="Đã xuất %d host: %s  +  %s" % (
+                len(series), path, os.path.basename(stats_path)))
+        except (OSError, ValueError) as ex:
+            messagebox.showerror("Lỗi", str(ex))
+
 
 def main():
     if IS_WIN:
